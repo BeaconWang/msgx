@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 #include <optional>
+#include <chrono>
 
 #define UNLOCK_AFTER_NOTIFY 1
 #define COMPAT_CODE 1
@@ -72,6 +73,9 @@ __________
 ///     -- Modify.Beacon.20250616
 ///         -- 1. 对所有 send 函数添加超时能力
 ///         -- 2. 添加 disabled 函数，用于判断是否已经处在退出状态或已退出（禁用）
+///     -- Modify.Beacon.20250811
+///         -- 1. 对于一次性定时器，在触发完毕后，立即移除，而不是等到下次调度时才移除
+///         -- 2. 对于多次设置相同ID的定时器，原逻辑会返回失败，现逻辑直接替换定时器配置信息（与 Win32API SetTimer 保持一致）
 
 /*
 主要特性
@@ -861,10 +865,10 @@ namespace msgx {
         * ### _Modify
         * - **功能**：线程安全地修改消息队列，执行指定的推送操作。
         * - **参数**：
-        *   - `_Push_function`: 要执行的推送操作（lambda 或函数对象）。
+        *   - `_Modify_function`: 要执行的修改操作（lambda 或函数对象）。
         * - **返回值**：`bool`，若操作成功（未处于退出状态）返回 true，否则返回 false。
         */
-        bool _Modify(std::function<void()> _Push_function)
+        bool _Modify(std::function<void()> _Modify_function)
         {
             std::unique_lock<_TyMutex> locker(_My_mtx, std::defer_lock);
             locker.lock();
@@ -872,7 +876,7 @@ namespace msgx {
                 return false;
             }
 
-            _Push_function();
+            _Modify_function();
 
 #if UNLOCK_AFTER_NOTIFY
             locker.unlock();
@@ -1202,6 +1206,7 @@ namespace msgx {
         *   - `func`: 可调用对象，定义定时器触发时的逻辑。
         *   - `args`: 可变参数，传递给 func 的参数，需兼容 _Arg_t。
         * - **返回值**：`bool`，表示定时器是否成功设置。
+        * - **备注**：如果定时器已存在，则更新其配置信息。
         */
         template < typename __Rep, typename __Period, typename __Function_t, typename... __Args_t,
             std::enable_if_t<std::is_void_v<std::invoke_result_t<__Function_t, __Args_t...>>, int> = 0>
@@ -1211,8 +1216,7 @@ namespace msgx {
             schedule_mode mode,
             __Function_t&& func, __Args_t&&... args)
         {
-            bool _Result = false;
-            _TyBase::_Modify([&]
+            return _TyBase::_Modify([&]
                 {
                     auto _Timer_ptr = std::make_shared<_TyTimer>(
                         key,
@@ -1232,16 +1236,14 @@ namespace msgx {
                     auto [_Iter, _Inserted] = _My_timers.insert({ key, _Timer_ptr });
 
                     if (!_Inserted) {
-                        return;
+                        // If the timer already exists, update the pointer
+                        _Iter->second = _Timer_ptr;
                     }
 
+                    // Insert the timer into the sorted list
                     _Insert_sorted_timer(_Timer_ptr);
-
-                    _Result = true;
                 }
             );
-
-            return _Result;
         }
 
         /*
@@ -1377,7 +1379,11 @@ namespace msgx {
                         _Do_timer(*_Timer_ptr);
                         locker.lock();
 
-                        if (!_Removed(_Timer_ptr) && // If killed timer in callback
+                        if (_Schedule_mode == schedule_mode::call_once) {
+                            // One-time timer, remove it
+                            _My_timers.erase(std::get<IDX_KEY>(*_Timer_ptr));
+                        }
+                        else if (!_Removed(_Timer_ptr) && // If killed timer in callback
                             _Schedule_mode == schedule_mode::fixed_delay) {
                             std::get<IDX_TIMEPOINT>(*_Timer_ptr) = _Clock_t::now() + std::get<IDX_DURATION>(*_Timer_ptr);
                             _Insert_sorted_timer(_Timer_ptr);
@@ -1477,26 +1483,13 @@ namespace msgx {
             if (iter == _My_timers.cend()) {
                 return true;
             }
+
             return iter->second != _Timer_ptr;
         }
     protected:
         // Timers
         std::multimap<_TyTimepoint, _TyTimerPtr> _My_sorted_timers;
         std::map<_TyKey, _TyTimerPtr> _My_timers;
-    };
-
-
-    template <
-        typename _Arg_t = std::any,
-        typename _Result_t = std::any,
-        typename _Key_t = uintptr_t,
-        typename _Group_t = uintptr_t,
-        typename _Duration_t = std::chrono::nanoseconds,
-        typename _Clock_t = std::chrono::steady_clock
-    >
-    class _Grouped_timer_message_loop
-        : public _Timer_message_loop<_Arg_t, _Result_t, _Key_t, _Duration_t, _Clock_t>
-    {
     };
     /*
     ## 3. _Thread_loop
@@ -1812,3 +1805,5 @@ protected: \
 
 #define XEND_TIMER_MAP() \
 }
+
+// ================================================================================
